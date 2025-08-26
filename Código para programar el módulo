@@ -1,0 +1,243 @@
+/*
+ * SISTEMA DE MONITOREO DE ENERGÍA CON ESP32
+ * Este programa mide voltaje y corriente en tres líneas, almacena datos en SD
+ * y los envía a ThingsBoard via MQTT
+ */
+
+// ============ SECCIÓN 1: BIBLIOTECAS ============
+#include "EmonLib.h"           // Biblioteca para medición de energía
+#include "virtuabotixRTC.h"    // Biblioteca para el RTC (Reloj de Tiempo Real)
+#include <SD.h>                // Biblioteca para manejar tarjeta SD
+#include <SPI.h>               // Biblioteca para comunicación SPI
+#include <WiFi.h>              // Biblioteca para conexión WiFi
+#include <PubSubClient.h>      // Biblioteca cliente MQTT
+
+// ============ SECCIÓN 2: CONFIGURACIÓN DE PINES ============
+// Pines para el RTC DS1302
+#define CLK_PIN 14     // Pin de reloj para el RTC
+#define DAT_PIN 27     // Pin de datos para el RTC
+#define RST_PIN 26     // Pin de reset para el RTC
+
+// Pines para los sensores (ADC)
+#define VOLTAGE 36     // Pin ADC para medir voltaje (GPIO36)
+#define CURRENT1 39    // Pin ADC para medir corriente línea 1 (GPIO39)
+#define CURRENT2 32    // Pin ADC para medir corriente línea 2 (GPIO32)
+#define CURRENT3 33    // Pin ADC para medir corriente línea 3 (GPIO33)
+
+// Pines para la tarjeta SD
+#define SD_CS 5        // Pin Chip Select para tarjeta SD (GPIO5)
+#define SD_MOSI 23     // Pin MOSI para comunicación SPI (GPIO23)
+#define SD_MISO 19     // Pin MISO para comunicación SPI (GPIO19)
+#define SD_SCK 18      // Pin SCK para comunicación SPI (GPIO18)
+
+// ============ SECCIÓN 3: CONSTANTES DE CALIBRACIÓN ============
+#define VOLT_CAL 123.8      // Constante de calibración para medición de voltaje
+#define CURRENT_CAL 15.4    // Constante de calibración para medición de corriente
+
+// ============ SECCIÓN 4: CONFIGURACIÓN WiFi y MQTT ============
+const char* ssid = "ALUMNOS";                   // Nombre de la red WiFi
+const char* password = "alumn05ier";            // Contraseña de la red WiFi
+const char* mqttServer = "tb.ier.unam.mx";      // Servidor MQTT de ThingsBoard
+const char* deviceToken = "jwV4TIyt7cch3q1OhLUf"; // Token del dispositivo en ThingsBoard
+
+// ============ SECCIÓN 5: DECLARACIÓN DE OBJETOS ============
+virtuabotixRTC myRTC(CLK_PIN, DAT_PIN, RST_PIN);  // Objeto para controlar el RTC
+EnergyMonitor emon1, emon2, emon3;                // Objetos para medición de energía
+WiFiClient espClient;                             // Cliente WiFi para ESP32
+PubSubClient client(espClient);                   // Cliente MQTT que usa el cliente WiFi
+
+// ============ SECCIÓN 6: VARIABLES DE TIEMPO ============
+unsigned long intervalSensors = 1000;        // Intervalo para lectura de sensores (1 segundo)
+unsigned long previousMillisSensors = 0;     // Marca de tiempo de la última lectura de sensores
+unsigned long intervalDataLog = 10000;       // Intervalo para guardar en SD (10 segundos)
+unsigned long previousMillisDL = 0;          // Marca de tiempo del último guardado en SD
+unsigned long previousMillisMQTT = 0;        // Marca de tiempo del último envío MQTT
+const unsigned long intervalMQTT = 5000;     // Intervalo para envío a ThingsBoard (5 segundos)
+
+// ============ SECCIÓN 7: VARIABLES DE MEDICIÓN ============
+float volt = 0;     // Variable para almacenar el valor de voltaje medido
+float line1 = 0;    // Variable para almacenar la corriente de la línea 1
+float line2 = 0;    // Variable para almacenar la corriente de la línea 2
+float line3 = 0;    // Variable para almacenar la corriente de la línea 3
+
+// ============ SECCIÓN 8: BUFFER PARA DATOS ============
+char buf[100];      // Buffer para formatear datos antes de guardar en SD
+
+// ============ SECCIÓN 9: CONFIGURACIÓN INICIAL ============
+void setup() {
+  Serial.begin(115200);           // Inicializar comunicación serial a 115200 baudios
+  while (!Serial);                // Esperar a que se inicie el puerto serial (solo para algunas placas)
+
+  // Configuración del RTC (descomentar solo para configurar hora inicial una vez)
+  // myRTC.setDS1302Time(0, 0, 0, 1, 1, 2023); // seg, min, hora, dia, mes, año
+
+  // Configurar monitores de energía
+  emon1.voltage(VOLTAGE, VOLT_CAL, 1.4);  // Configurar pin y calibración para medición de voltaje
+  emon1.current(CURRENT1, CURRENT_CAL);   // Configurar pin y calibración para medición de corriente línea 1
+  emon2.current(CURRENT2, CURRENT_CAL);   // Configurar pin y calibración para medición de corriente línea 2
+  emon3.current(CURRENT3, CURRENT_CAL);   // Configurar pin y calibración para medición de corriente línea 3
+
+  // Inicializar tarjeta SD con configuración SPI personalizada
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);  // Inicializar comunicación SPI con pines personalizados
+  
+  Serial.print("Iniciando tarjeta SD...");  // Mensaje de inicio de inicialización de SD
+  if (!SD.begin(SD_CS)) {              // Intentar inicializar tarjeta SD con el pin CS especificado
+    Serial.println("¡Fallo en inicialización!");  // Mensaje de error si falla la inicialización
+    while (1);                         // Detener ejecución indefinidamente si falla
+  }
+  Serial.println("Inicialización correcta.");  // Mensaje de éxito en inicialización
+
+  // Crear archivo con encabezados si no existe
+  if (!SD.exists("/datalog.csv")) {    // Verificar si el archivo ya existe
+    File dataFile = SD.open("/datalog.csv", FILE_WRITE);  // Abrir archivo en modo escritura
+    if (dataFile) {                    // Verificar si se abrió correctamente
+      dataFile.println("Fecha,Hora,Tension(V),Corriente1(A),Corriente2(A),Corriente3(A)");  // Escribir encabezados
+      dataFile.close();                // Cerrar archivo
+      Serial.println("Archivo creado con encabezados");  // Mensaje de confirmación
+    } else {
+      Serial.println("Error al crear archivo!");  // Mensaje de error
+    }
+  }
+
+  // Conectar al WiFi
+  WiFi.begin(ssid, password);          // Iniciar conexión WiFi con credenciales
+  Serial.print("Conectando al WiFi...");  // Mensaje de inicio de conexión
+  while (WiFi.status() != WL_CONNECTED) {  // Esperar hasta que se establezca la conexión
+    delay(1000);                    // Esperar 1 segundo entre intentos
+    Serial.print(".");              // Mostrar punto como indicador de progreso
+  }
+  Serial.println("\n✅ Conectado al WiFi");  // Mensaje de conexión exitosa
+
+  // Configurar servidor MQTT y conectar
+  client.setServer(mqttServer, 1883);  // Establecer servidor MQTT y puerto
+  reconnectMQTT();                     // Llamar función para conectar a MQTT
+}
+
+// ============ SECCIÓN 10: BUCLE PRINCIPAL ============
+void loop() {
+  unsigned long currentMillis = millis();  // Obtener tiempo actual en milisegundos
+
+  // Lectura periódica de sensores (cada 1 segundo)
+  if (currentMillis - previousMillisSensors >= intervalSensors) {  // Verificar si ha pasado el intervalo
+    previousMillisSensors = currentMillis;  // Actualizar marca de tiempo
+    readSensors();              // Llamar función para leer valores de sensores
+    printSerialData();          // Llamar función para mostrar datos por serial
+  }
+
+  // Guardado periódico en SD (cada 10 segundos)
+  if (currentMillis - previousMillisDL >= intervalDataLog) {  // Verificar si ha pasado el intervalo
+    previousMillisDL = currentMillis;  // Actualizar marca de tiempo
+    if (saveToSD()) {            // Intentar guardar datos en SD
+      Serial.println("Datos guardados en SD");  // Mensaje de éxito
+    } else {
+      Serial.println("Error al guardar en SD");  // Mensaje de error
+    }
+  }
+
+  // Verificar y mantener conexión MQTT
+  if (!client.connected()) {     // Verificar si se perdió la conexión MQTT
+    reconnectMQTT();             // Reconectar si es necesario
+  }
+  client.loop();                // Mantener conexión MQTT activa (procesar mensajes)
+
+  // Envío periódico a ThingsBoard (cada 5 segundos)
+  if (currentMillis - previousMillisMQTT >= intervalMQTT) {  // Verificar si ha pasado el intervalo
+    previousMillisMQTT = currentMillis;  // Actualizar marca de tiempo
+    sendToThingsBoard();        // Llamar función para enviar datos a ThingsBoard
+  }
+}
+
+// ============ SECCIÓN 11: LECTURA DE SENSORES ============
+void readSensors() {
+  // Calcular valores RMS de voltaje y corriente
+  emon1.calcVI(20, 2000);  // Calcular valores RMS para sensor 1 (20 ciclos, timeout 2000ms)
+  emon2.calcVI(20, 2000);  // Calcular valores RMS para sensor 2 (20 ciclos, timeout 2000ms)
+  emon3.calcVI(20, 2000);  // Calcular valores RMS para sensor 3 (20 ciclos, timeout 2000ms)
+  
+  // Almacenar valores calculados
+  volt = emon1.Vrms;   // Obtener voltaje RMS del sensor 1
+  line1 = emon1.Irms;  // Obtener corriente RMS de la línea 1
+  line2 = emon2.Irms;  // Obtener corriente RMS de la línea 2
+  line3 = emon3.Irms;  // Obtener corriente RMS de la línea 3
+}
+
+// ============ SECCIÓN 12: GUARDADO EN TARJETA SD ============
+bool saveToSD() {
+  myRTC.updateTime();  // Actualizar datos del RTC (leer hora actual)
+  
+  // Formatear fecha, hora y datos de sensores en buffer
+  snprintf(buf, sizeof(buf), "%02d/%02d/%04d,%02d:%02d:%02d,%.2f,%.2f,%.2f,%.2f",
+           myRTC.dayofmonth, myRTC.month, myRTC.year,    // Datos de fecha (día, mes, año)
+           myRTC.hours, myRTC.minutes, myRTC.seconds,    // Datos de hora (hora, minuto, segundo)
+           volt, line1, line2, line3);                   // Datos de sensores (voltaje, corrientes)
+
+  // Abrir archivo en modo append (agregar al final)
+  File dataFile = SD.open("/datalog.csv", FILE_APPEND);  // Abrir archivo para agregar datos
+  if (dataFile) {                    // Verificar si se abrió correctamente
+    dataFile.println(buf);  // Escribir línea de datos en el archivo
+    dataFile.close();       // Cerrar archivo
+    return true;            // Retornar éxito
+  }
+  return false;             // Retornar error
+}
+
+// ============ SECCIÓN 13: VISUALIZACIÓN POR SERIAL ============
+void printSerialData() {
+  myRTC.updateTime(); // Actualizar datos del RTC (leer hora actual)
+  
+  // Mostrar fecha y hora en formato legible
+  Serial.print("Fecha: ");          // Etiqueta para fecha
+  Serial.print(myRTC.dayofmonth);   // Día del mes
+  Serial.print("/");                // Separador
+  Serial.print(myRTC.month);        // Mes
+  Serial.print("/");                // Separador
+  Serial.print(myRTC.year);         // Año
+  Serial.print(" ");                // Espacio
+  
+  Serial.print("Hora: ");           // Etiqueta para hora
+  Serial.print(myRTC.hours);        // Horas
+  Serial.print(":");                // Separador
+  Serial.print(myRTC.minutes);      // Minutos
+  Serial.print(":");                // Separador
+  Serial.print(myRTC.seconds);      // Segundos
+  Serial.print(" | ");              // Separador
+  
+  // Mostrar datos de sensores
+  Serial.print("V: "); Serial.print(volt);      // Mostrar voltaje
+  Serial.print(" | I1: "); Serial.print(line1); // Mostrar corriente línea 1
+  Serial.print(" | I2: "); Serial.print(line2); // Mostrar corriente línea 2
+  Serial.print(" | I3: "); Serial.println(line3); // Mostrar corriente línea 3 y salto de línea
+}
+
+// ============ SECCIÓN 14: ENVÍO A THINGSBOARD ============
+void sendToThingsBoard() {
+  // Construir payload JSON con los datos de los sensores
+  String payload = "{";                       // Inicio del objeto JSON
+  payload += "\"voltage\":" + String(volt, 2) + ",";      // Agregar voltaje con 2 decimales
+  payload += "\"current1\":" + String(line1, 2) + ",";    // Agregar corriente 1 con 2 decimales
+  payload += "\"current2\":" + String(line2, 2) + ",";    // Agregar corriente 2 con 2 decimales
+  payload += "\"current3\":" + String(line3, 2);          // Agregar corriente 3 con 2 decimales
+  payload += "}";                            // Fin del objeto JSON
+
+  Serial.print("📤 Enviando a ThingsBoard: ");  // Mensaje de envío
+  Serial.println(payload);                   // Mostrar payload que se enviará
+
+  // Publicar datos en topic MQTT de ThingsBoard
+  client.publish("v1/devices/me/telemetry", (char*)payload.c_str());  // Publicar en topic MQTT
+}
+
+// ============ SECCIÓN 15: RECONEXIÓN MQTT ============
+void reconnectMQTT() {
+  while (!client.connected()) {     // Intentar hasta que se establezca conexión
+    Serial.print("🔄 Conectando a ThingsBoard... ");  // Mensaje de intento de conexión
+    // Intentar conexión con token de dispositivo
+    if (client.connect("ESP32Client", deviceToken, NULL)) {  // Conectar con nombre y token
+      Serial.println("✅ Conectado a ThingsBoard!");  // Mensaje de conexión exitosa
+    } else {
+      Serial.print("❌ Fallo, rc=");              // Mensaje de error
+      Serial.print(client.state());              // Mostrar estado de error MQTT
+      Serial.println(" Reintentando en 5s...");  // Mensaje de reintento
+      delay(5000);                              // Esperar 5 segundos antes de reintentar
+    }
+  }
+}
