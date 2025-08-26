@@ -1,0 +1,10 @@
+void setup() {
+  pinMode(2, OUTPUT); // El pin 2 generalmente está conectado al LED en placas DevKit
+}
+
+void loop() {
+  digitalWrite(2, HIGH); // Enciende LED
+  delay(1000);           // Espera 1 segundo
+  digitalWrite(2, LOW);  // Apaga LED
+  delay(1000);           // Espera 1 segundo
+}
