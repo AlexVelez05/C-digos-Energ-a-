@@ -1,0 +1,41 @@
+#include <virtuabotixRTC.h>
+
+// Definir pines de conexión (ajusta según tu wiring)
+#define CLK 14
+#define DAT 27
+#define RST 26
+
+// Crear objeto RTC
+virtuabotixRTC miRTC(CLK, DAT, RST);
+
+void setup() {
+  Serial.begin(9600);
+  
+  // Solo ejecutar una vez para configurar la hora inicial
+  // Después comentar estas líneas y volver a cargar el código
+  miRTC.setDS1302Time(00, 19, 17, 2, 28, 3, 2024); 
+  // Formato: segundos, minutos, horas, día de semana, día, mes, año
+  // Día de semana: 1=Domingo, 2=Lunes, ..., 7=Sábado
+}
+
+void loop() {
+  // Leer la hora actual del RTC
+  miRTC.updateTime();
+  
+  // Mostrar fecha y hora por el monitor serial
+  Serial.print("Fecha: ");
+  Serial.print(miRTC.dayofmonth);
+  Serial.print("/");
+  Serial.print(miRTC.month);
+  Serial.print("/");
+  Serial.print(miRTC.year);
+  
+  Serial.print("  Hora: ");
+  Serial.print(miRTC.hours);
+  Serial.print(":");
+  Serial.print(miRTC.minutes);
+  Serial.print(":");
+  Serial.println(miRTC.seconds);
+  
+  delay(1000);
+}
